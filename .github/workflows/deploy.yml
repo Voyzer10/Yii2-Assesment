@@ -1,60 +1,61 @@
-name: CI/CD Deploy to EC2
+name: Deploy to EC2
 
 on:
   push:
     branches:
       - main
 
-env:
-  IMAGE_NAME: yourdockerhubusername/your-app-name
-  SERVICE_NAME: yii2_app
-  REMOTE_DOCKER_CONTEXT: /home/ubuntu/yii2-app  # Adjust as per your setup
-
 jobs:
-  deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
+    env:
+      IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/yii2-app
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v2
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+    - name: Build and push Docker images
+      run: |
+        SHORT_SHA=$(echo $GITHUB_SHA | cut -c1-7)
+        docker buildx create --use
+        docker buildx build --platform linux/amd64 \
+          -t $IMAGE_NAME:latest \
+          -t $IMAGE_NAME:$SHORT_SHA \
+          --push .
 
-      - name: Build and Push Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ env.IMAGE_NAME }}:latest
+    - name: SSH into EC2 and deploy
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USER }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        script: |
+          set -e
 
-      - name: SSH into EC2 and Deploy
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script: |
-            set -e
+          IMAGE_LATEST=${{ secrets.DOCKER_USERNAME }}/yii2-app:latest
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_VERSIONED=${{ secrets.DOCKER_USERNAME }}/yii2-app:$SHORT_SHA
 
-            echo "Pulling new Docker image"
-            docker pull ${{ env.IMAGE_NAME }}:latest
+          echo "Pulling latest image..."
+          docker pull $IMAGE_VERSIONED
 
-            echo "Updating Swarm service"
-            docker service update --image ${{ env.IMAGE_NAME }}:latest --detach=false ${{ env.SERVICE_NAME }}
+          echo "Saving currently running image for rollback..."
+          CURRENT_IMAGE=$(docker service inspect yii2_app_service --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')
 
-            echo "Verifying service status"
-            if ! docker service ps ${{ env.SERVICE_NAME }} --no-trunc | grep -q "Running"; then
-              echo "Service update failed. Rolling back..."
-              docker service rollback ${{ env.SERVICE_NAME }}
-              exit 1
-            fi
+          echo "Attempting to update service..."
+          if docker service update --image $IMAGE_VERSIONED yii2_app_service; then
+            echo "✅ Update successful"
+          else
+            echo "❌ Update failed! Rolling back to previous image: $CURRENT_IMAGE"
+            docker service update --image $CURRENT_IMAGE yii2_app_service
+          fi
 
-            echo "Deployment completed successfully."
 
