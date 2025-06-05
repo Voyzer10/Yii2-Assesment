@@ -1,0 +1,60 @@
+name: CI/CD Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+env:
+  IMAGE_NAME: yourdockerhubusername/your-app-name
+  SERVICE_NAME: yii2_app
+  REMOTE_DOCKER_CONTEXT: /home/ubuntu/yii2-app  # Adjust as per your setup
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:latest
+
+      - name: SSH into EC2 and Deploy
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            echo "Pulling new Docker image"
+            docker pull ${{ env.IMAGE_NAME }}:latest
+
+            echo "Updating Swarm service"
+            docker service update --image ${{ env.IMAGE_NAME }}:latest --detach=false ${{ env.SERVICE_NAME }}
+
+            echo "Verifying service status"
+            if ! docker service ps ${{ env.SERVICE_NAME }} --no-trunc | grep -q "Running"; then
+              echo "Service update failed. Rolling back..."
+              docker service rollback ${{ env.SERVICE_NAME }}
+              exit 1
+            fi
+
+            echo "Deployment completed successfully."
+
